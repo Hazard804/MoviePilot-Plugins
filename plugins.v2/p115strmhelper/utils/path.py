@@ -10,6 +10,27 @@ from app.log import logger
 from app.utils.system import SystemUtils
 
 
+def _sanitize_windows_path_part(part: str) -> str:
+    """
+    清理 Windows 单个路径分量中的非法字符和控制字符
+
+    :param part: 单个路径分量
+    :return: 处理后的路径分量
+    """
+    illegal_chars = '<>"|?*'
+    sanitized: List[str] = []
+    for char in part:
+        if ord(char) < 32:
+            continue
+        if char == ":":
+            sanitized.append("：")
+        elif char in illegal_chars:
+            sanitized.append("_")
+        else:
+            sanitized.append(char)
+    return "".join(sanitized)
+
+
 class PathUtils:
     """
     路径匹配
@@ -18,23 +39,19 @@ class PathUtils:
     @staticmethod
     def sanitize_path_parts(rel_path: Path) -> Path:
         """
-        将相对路径各分量中的非法文件名字符替换为下划线（仅 Windows 生效，其他平台直接返回原路径）
+        将相对路径各分量中的非法文件名字符替换为下划线，并移除控制字符（仅 Windows 生效，其他平台直接返回原路径）
 
         :param rel_path: 待处理的相对路径
         :return: 处理后的相对路径
         """
         if os_name != "nt":
             return rel_path
-        illegal_chars = '<>"|?*'
         parts = list(rel_path.parts)
         if not parts:
             return rel_path
         sanitized = []
         for part in parts:
-            part = part.replace(":", "：")
-            for char in illegal_chars:
-                part = part.replace(char, "_")
-            sanitized.append(part)
+            sanitized.append(_sanitize_windows_path_part(part))
         result = Path(sanitized[0])
         for part in sanitized[1:]:
             result = result / part
