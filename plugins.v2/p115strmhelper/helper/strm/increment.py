@@ -1,12 +1,17 @@
 from collections import deque
-from fcntl import flock, LOCK_EX, LOCK_UN
+from errno import EACCES, EDEADLK
 from functools import partial
 from itertools import batched
-from os import close, O_CREAT, O_RDWR, open as os_open
+from os import close, name as os_name, O_CREAT, O_RDWR, SEEK_SET, lseek, open as os_open
 from pathlib import Path
 from threading import Thread
 from time import perf_counter, sleep
 from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple
+
+if os_name == "nt":
+    from msvcrt import LK_NBLCK, LK_UNLCK, locking
+else:
+    from fcntl import LOCK_EX, LOCK_UN, flock
 
 from p115client import P115Client
 from p115client.tool.export_dir import (
@@ -42,6 +47,35 @@ from ...utils.path import PathRemoveUtils, PathUtils
 from ...utils.sentry import sentry_manager
 from ...utils.strm import StrmGenerater, StrmUrlGetter
 from ...utils.tree import DirectoryTree
+
+
+def _lock_file(lock_fd: int) -> None:
+    """
+    获取跨平台跨进程文件锁
+    """
+    if os_name == "nt":
+        while True:
+            try:
+                lseek(lock_fd, 0, SEEK_SET)
+                locking(lock_fd, LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in (EACCES, EDEADLK):
+                    raise
+                sleep(0.25)
+    else:
+        flock(lock_fd, LOCK_EX)
+
+
+def _unlock_file(lock_fd: int) -> None:
+    """
+    释放跨平台跨进程文件锁
+    """
+    if os_name == "nt":
+        lseek(lock_fd, 0, SEEK_SET)
+        locking(lock_fd, LK_UNLCK, 1)
+    else:
+        flock(lock_fd, LOCK_UN)
 
 
 class IncrementSyncStrmHelper:
@@ -204,9 +238,11 @@ class IncrementSyncStrmHelper:
 
         lock_path = configer.PLUGIN_TEMP_PATH / "export_dir.lock"
         lock_fd = os_open(str(lock_path), O_CREAT | O_RDWR)
+        locked = False
 
         try:
-            flock(lock_fd, LOCK_EX)
+            _lock_file(lock_fd)
+            locked = True
 
             def custom_escape(name):
                 """
@@ -274,7 +310,8 @@ class IncrementSyncStrmHelper:
             if previous_item is not None:
                 yield from process_file_item(previous_item)
         finally:
-            flock(lock_fd, LOCK_UN)
+            if locked:
+                _unlock_file(lock_fd)
             close(lock_fd)
 
     def __iterdir(self, cid: int, path: str) -> Iterator:
