@@ -1,5 +1,5 @@
-from pathlib import Path
 from os import pathsep
+from pathlib import Path
 from shutil import copy2
 from typing import Set
 
@@ -8,6 +8,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.runtime.environment import EnvironmentContext
 from alembic.script import ScriptDirectory
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
@@ -117,6 +118,26 @@ def get_ancestors(script: ScriptDirectory, revision_id: str) -> Set[str]:
     return ancestors
 
 
+def stamp_revision_directly(revision_id: str) -> None:
+    """
+    直接写入 Alembic 版本记录
+
+    :param revision_id: 已通过脚本目录解析校验的目标 revision
+    """
+    with ct_db_manager.Engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS alembic_version "
+                "(version_num VARCHAR(32) NOT NULL)"
+            )
+        )
+        connection.execute(text("DELETE FROM alembic_version"))
+        connection.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:revision_id)"),
+            {"revision_id": revision_id},
+        )
+
+
 def sync_to_revision(
     script_location: str,
     sqlalchemy_url: str,
@@ -165,9 +186,16 @@ def sync_to_revision(
         current_heads = set(migration_context.get_current_heads())
 
     if not current_heads:
-        logger.info("数据库当前为空（没有版本记录）。将执行升级操作。")
-        command.upgrade(alembic_cfg, resolved_target_rev)
-        logger.info(f"--- 成功迁移到版本: {resolved_target_rev} ---")
+        logger.info("数据库没有版本记录。模型表已初始化，将标记到目标版本。")
+        try:
+            command.stamp(alembic_cfg, resolved_target_rev)
+        except Exception as e:
+            logger.warning(
+                f"Alembic 标记版本失败，将直接写入版本记录: {e}",
+                exc_info=True,
+            )
+            stamp_revision_directly(resolved_target_rev)
+        logger.info(f"--- 成功标记数据库版本: {resolved_target_rev} ---")
         return
 
     logger.info(f"数据库当前版本头: {current_heads}")
