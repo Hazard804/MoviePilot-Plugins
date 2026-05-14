@@ -1,4 +1,5 @@
 from pathlib import Path
+from os import pathsep
 from shutil import copy2
 from typing import Set
 
@@ -50,7 +51,7 @@ def migration_db(db_path, script_location, version_locations: list):
         sqlalchemy_url=f"sqlite:///{db_path}",
         script_location=str(script_location),
         target_revision=revision,
-        version_locations=" ".join(version_locations) if version_locations else None,
+        version_locations=pathsep.join(version_locations) if version_locations else None,
     )
 
 
@@ -131,6 +132,7 @@ def sync_to_revision(
     alembic_cfg = Config()
     alembic_cfg.set_main_option("script_location", script_location)
     if version_locations:
+        alembic_cfg.set_main_option("version_path_separator", "os")
         alembic_cfg.set_main_option("version_locations", version_locations)
     alembic_cfg.set_main_option("sqlalchemy.url", sqlalchemy_url)
 
