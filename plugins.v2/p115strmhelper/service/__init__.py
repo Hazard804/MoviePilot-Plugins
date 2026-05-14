@@ -8,12 +8,12 @@ from typing import List, Optional
 from aligo.core import set_config_folder
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from p115client import P115Client
 from pytz import timezone
 from watchfiles import watch, Change
 
 from ..core.aliyunpan import BAligo
 from ..core.config import configer
+from ..core.p115_client import create_client
 from ..core.i18n import i18n
 from ..core.message import post_message
 from ..core.p115 import get_pid_by_path
@@ -43,6 +43,9 @@ from ..schemas.monitor import ObserverInfo
 from ..service.fuse import FuseManager
 from ..service.life import monitor_life_thread_worker
 from ..service.hdhive_checkin.scheduler import hdhive_checkin_scheduler_tick
+from ..service.p115_checkin.scheduler import (
+    p115_checkin_scheduler_tick as p115_scheduler_tick,
+)
 from ..utils.sentry import sentry_manager
 
 from app.log import logger
@@ -87,38 +90,51 @@ class ServiceHelper:
 
         self.share_interactive_gen_strm_queue = ShareInteractiveGenStrmQueue()
 
+        self._sync_state_lock = Lock()
+        self._full_sync_running = False
+        self._increment_sync_running = False
+        self._full_sync_pending = False
+
     def init_service(self):
         """
         初始化服务
         """
         try:
             # 115 网盘客户端初始化
-            self.client = P115Client(configer.cookies)
+            self.client = create_client(
+                configer.cookies,
+                default_timeout=configer.get_default_timeout(),
+                slow_timeout=configer.get_slow_timeout(),
+            )
 
             # 阿里云盘登入
             aligo_config = configer.get_config("PLUGIN_ALIGO_PATH")
-            if configer.get_config("aliyundrive_token"):
-                set_config_folder(aligo_config)
-                if Path(aligo_config / "aligo.json").exists():
-                    logger.debug("Config login aliyunpan")
-                    self.aligo = BAligo(level=ERROR, re_login=False)
-                else:
-                    logger.debug("Refresh token login aliyunpan")
-                    self.aligo = BAligo(
-                        refresh_token=configer.get_config("aliyundrive_token"),
-                        level=ERROR,
-                        re_login=False,
-                    )
-                # 默认操作资源盘
-                v2_user = self.aligo.v2_user_get()
-                logger.debug(f"AliyunPan user info: {v2_user}")
-                resource_drive_id = v2_user.resource_drive_id
-                self.aligo.default_drive_id = resource_drive_id
-            elif (
-                not configer.get_config("aliyundrive_token")
-                and not Path(aligo_config / "aligo.json").exists()
-            ):
-                logger.debug("Login out aliyunpan")
+            try:
+                if configer.get_config("aliyundrive_token"):
+                    set_config_folder(aligo_config)
+                    if Path(aligo_config / "aligo.json").exists():
+                        logger.debug("Config login aliyunpan")
+                        self.aligo = BAligo(level=ERROR, re_login=False)
+                    else:
+                        logger.debug("Refresh token login aliyunpan")
+                        self.aligo = BAligo(
+                            refresh_token=configer.get_config("aliyundrive_token"),
+                            level=ERROR,
+                            re_login=False,
+                        )
+                    # 默认操作资源盘
+                    v2_user = self.aligo.v2_user_get()
+                    logger.debug(f"AliyunPan user info: {v2_user}")
+                    resource_drive_id = v2_user.resource_drive_id
+                    self.aligo.default_drive_id = resource_drive_id
+                elif (
+                    not configer.get_config("aliyundrive_token")
+                    and not Path(aligo_config / "aligo.json").exists()
+                ):
+                    logger.debug("Login out aliyunpan")
+                    self.aligo = None
+            except Exception as e:
+                logger.warning(f"阿里云盘登入失败，跳过初始化: {e}")
                 self.aligo = None
 
             # 媒体信息下载工具初始化
@@ -403,7 +419,26 @@ class ServiceHelper:
 
     def full_sync_strm_files(self):
         """
-        全量同步
+        全量同步（带并发互斥与优先级控制）
+        """
+        with self._sync_state_lock:
+            if self._full_sync_running:
+                logger.info("【全量同步】全量同步已在运行，跳过本次触发")
+                return
+            if self._increment_sync_running:
+                logger.info("【全量同步】增量同步正在运行，已登记待执行全量同步")
+                self._full_sync_pending = True
+                return
+            self._full_sync_running = True
+        try:
+            self._run_full_sync()
+        finally:
+            with self._sync_state_lock:
+                self._full_sync_running = False
+
+    def _run_full_sync(self):
+        """
+        全量同步实际执行逻辑
         """
         if (
             not configer.get_config("full_sync_strm_paths")
@@ -547,7 +582,32 @@ class ServiceHelper:
 
     def increment_sync_strm_files(self, send_msg: bool = False):
         """
-        增量同步
+        增量同步（带并发互斥与优先级控制）
+        """
+        with self._sync_state_lock:
+            if self._full_sync_running:
+                logger.info("【增量同步】全量同步正在运行，跳过本次增量同步")
+                return
+            if self._increment_sync_running:
+                logger.info("【增量同步】增量同步已在运行，跳过本次触发")
+                return
+            self._increment_sync_running = True
+        try:
+            self._run_increment_sync(send_msg)
+        finally:
+            run_full = False
+            with self._sync_state_lock:
+                self._increment_sync_running = False
+                if self._full_sync_pending:
+                    self._full_sync_pending = False
+                    run_full = True
+            if run_full:
+                logger.info("【增量同步】增量同步完成，执行待运行的全量同步")
+                self.full_sync_strm_files()
+
+    def _run_increment_sync(self, send_msg: bool = False):
+        """
+        增量同步实际执行逻辑
         """
         if (
             not configer.get_config("increment_sync_strm_paths")
@@ -599,6 +659,12 @@ class ServiceHelper:
         HDHive 签到调度
         """
         hdhive_checkin_scheduler_tick()
+
+    def p115_checkin_scheduler_tick(self) -> None:
+        """
+        115 签到调度
+        """
+        p115_scheduler_tick(client=self.client)
 
     def start_directory_upload(self):
         """
@@ -692,6 +758,126 @@ class ServiceHelper:
             logger.error("【FUSE】FuseManager 未初始化")
             return False
         return self.fuse_manager.start_fuse(mountpoint, readdir_ttl)
+
+    def run_backup_task(self, task_name: str):
+        """
+        执行备份任务
+
+        :param task_name: 备份任务名称
+        """
+        if not configer.strm_backup_enabled:
+            return
+
+        backup_items = configer.strm_backup_items
+        task = None
+        for item in backup_items:
+            if item.name == task_name:
+                task = item
+                break
+
+        if not task:
+            logger.error(f"【STRM备份】备份任务不存在: {task_name}")
+            return
+
+        from ..helper.backup import backup_helper
+
+        logger.info(f"【STRM备份】开始执行备份任务: {task_name}")
+        history = backup_helper.execute_backup(task, client=self.client)
+
+        if history.status == "success":
+            logger.info(
+                f"【STRM备份】备份成功: {task_name}, "
+                f"文件: {history.filename}, 大小: {history.file_size} 字节"
+            )
+        elif history.status == "skipped":
+            logger.info(
+                f"【STRM备份】备份任务已跳过: {task_name}, 原因: {history.error_msg}"
+            )
+        else:
+            logger.error(
+                f"【STRM备份】备份失败: {task_name}, 错误: {history.error_msg}"
+            )
+
+    def start_backup_task(self, task):
+        """
+        启动备份任务
+
+        :param task: StrmBackupItem 备份任务配置
+        """
+        scheduler = BackgroundScheduler(timezone=settings.TZ)
+        scheduler.add_job(
+            func=self.run_backup_task,
+            args=[task.name],
+            trigger="date",
+            run_date=datetime.now(tz=timezone(settings.TZ)) + timedelta(seconds=3),
+            name=f"STRM备份-{task.name}",
+        )
+        if scheduler.get_jobs():
+            scheduler.print_jobs()
+            scheduler.start()
+
+    def run_restore_task(self, task_name: str, backup_path: str):
+        """
+        执行恢复任务
+
+        :param task_name: 备份任务名称
+        :param backup_path: 备份文件路径
+        """
+        if not configer.strm_backup_enabled:
+            return
+
+        backup_items = configer.strm_backup_items
+        task = None
+        for item in backup_items:
+            if item.name == task_name:
+                task = item
+                break
+
+        if not task:
+            logger.error(f"【STRM恢复】备份任务不存在: {task_name}")
+            return
+
+        from ..helper.backup import backup_helper
+
+        logger.info(f"【STRM恢复】开始执行恢复任务: {task_name}, 路径: {backup_path}")
+
+        if task.target_type.value == "local":
+            success, error_msg = backup_helper.restore_from_local(
+                backup_path=backup_path,
+                source_paths=task.source_paths,
+            )
+        elif task.target_type.value == "cloud":
+            success, error_msg = backup_helper.restore_from_cloud(
+                cloud_path=backup_path,
+                source_paths=task.source_paths,
+                client=self.client,
+            )
+        else:
+            success, error_msg = False, f"不支持的备份目标类型: {task.target_type}"
+
+        if success:
+            logger.info(f"【STRM恢复】恢复成功: {task_name}")
+        else:
+            logger.error(f"【STRM恢复】恢复失败: {task_name}, 错误: {error_msg}")
+
+    def start_restore_task(self, task_name: str, backup_path: str):
+        """
+        启动恢复任务
+
+        :param task_name: 备份任务名称
+        :param backup_path: 备份文件路径
+        """
+        scheduler = BackgroundScheduler(timezone=settings.TZ)
+        scheduler.add_job(
+            func=self.run_restore_task,
+            args=[task_name, backup_path],
+            trigger="date",
+            run_date=datetime.now(tz=timezone(settings.TZ)) + timedelta(seconds=3),
+            name=f"STRM恢复-{task_name}",
+        )
+        if scheduler.get_jobs():
+            scheduler.print_jobs()
+            scheduler.start()
 
     def stop_fuse(self):
         """

@@ -24,6 +24,7 @@ from ..sidebar_nav import sidebar_nav_keys_known
 from ..version import VERSION
 from ..core.aliyunpan import AliyunPanLogin
 from ..schemas.cookie import U115Cookie
+from ..schemas.backup import StrmBackupItem
 from ..schemas.share import (
     ShareInteractiveGenStrmConfig,
     ShareStrmCleanupConfig,
@@ -151,6 +152,21 @@ class ConfigManager(BaseModel):
         if isinstance(v, list):
             return [
                 ShareStrmConfig.model_validate(item) if isinstance(item, dict) else item
+                for item in v
+            ]
+        return []
+
+    @field_validator("strm_backup_items", mode="before")
+    @classmethod
+    def _validate_strm_backup_items(cls, v: Any) -> List[StrmBackupItem]:
+        """
+        验证并转换 strm_backup_items
+        """
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [
+                StrmBackupItem.model_validate(item) if isinstance(item, dict) else item
                 for item in v
             ]
         return []
@@ -335,6 +351,9 @@ class ConfigManager(BaseModel):
     transfer_monitor_media_server_refresh_enabled: bool = Field(
         default=False, description="刷新媒体服务器开关"
     )
+    transfer_monitor_media_server_refresh_delay: int = Field(
+        default=0, ge=0, description="延迟刷新媒体服务器（秒），0 表示不延迟"
+    )
     transfer_monitor_emby_mediainfo_enabled: bool = Field(
         default=False, description="EMBY 媒体信息提取开关"
     )
@@ -386,6 +405,9 @@ class ConfigManager(BaseModel):
     full_sync_media_server_refresh_enabled: bool = Field(
         default=False, description="全量同步刷新媒体服务器开关"
     )
+    full_sync_media_server_refresh_delay: int = Field(
+        default=0, ge=0, description="全量同步延迟刷新媒体服务器（秒），0 表示不延迟"
+    )
     full_sync_mediaservers: Optional[List[str]] = Field(
         default=None, description="全量同步刷新媒体服务器列表"
     )
@@ -430,6 +452,9 @@ class ConfigManager(BaseModel):
     )
     increment_sync_media_server_refresh_enabled: bool = Field(
         default=False, description="刷新媒体服务器开关"
+    )
+    increment_sync_media_server_refresh_delay: int = Field(
+        default=0, ge=0, description="增量同步延迟刷新媒体服务器（秒），0 表示不延迟"
     )
     increment_sync_mediaservers: Optional[List[str]] = Field(
         default=None, description="刷新媒体服务器"
@@ -476,6 +501,9 @@ class ConfigManager(BaseModel):
     )
     monitor_life_media_server_refresh_enabled: bool = Field(
         default=False, description="刷新媒体服务器开关"
+    )
+    monitor_life_media_server_refresh_delay: int = Field(
+        default=0, ge=0, description="生活事件延迟刷新媒体服务器（秒），0 表示不延迟"
     )
     monitor_life_mediaservers: Optional[List[str]] = Field(
         default=None, description="刷新媒体服务器"
@@ -536,6 +564,9 @@ class ConfigManager(BaseModel):
     share_strm_mediaservers: Optional[List[str]] = Field(
         default=None, description="刷新媒体服务器"
     )
+    share_strm_media_server_refresh_delay: int = Field(
+        default=0, ge=0, description="分享 STRM 延迟刷新媒体服务器（秒），0 表示不延迟"
+    )
     share_strm_mp_mediaserver_paths: Optional[str] = Field(
         default=None, description="MP-媒体库 目录转换"
     )
@@ -562,6 +593,9 @@ class ConfigManager(BaseModel):
     )
     api_strm_media_server_refresh_enabled: bool = Field(
         default=False, description="刷新媒体服务器开关"
+    )
+    api_strm_media_server_refresh_delay: int = Field(
+        default=0, ge=0, description="API STRM 延迟刷新媒体服务器（秒），0 表示不延迟"
     )
 
     clear_recyclebin_enabled: bool = Field(default=False, description="清理回收站开关")
@@ -658,6 +692,14 @@ class ConfigManager(BaseModel):
         default="06:00-09:00",
         description="HDHive 签到随机时间段 HH:MM-HH:MM",
     )
+    p115_checkin_enabled: bool = Field(
+        default=False,
+        description="115 每日签到",
+    )
+    p115_checkin_time_range: Optional[str] = Field(
+        default="06:00-09:00",
+        description="115 签到随机时间段 HH:MM-HH:MM",
+    )
     same_playback: bool = Field(default=False, description="多端播放同一个文件")
 
     error_info_upload: bool = Field(default=True, description="上传错误信息")
@@ -747,6 +789,11 @@ class ConfigManager(BaseModel):
     )
     strm_url_encode: bool = Field(default=False, description="STRM URL 文件名称编码")
 
+    strm_backup_enabled: bool = Field(default=False, description="STRM 备份功能总开关")
+    strm_backup_items: List[StrmBackupItem] = Field(
+        default_factory=list, description="STRM 备份任务列表"
+    )
+
     sync_del_enabled: bool = Field(default=False, description="同步删除开关")
     sync_del_notify: bool = Field(default=True, description="同步删除通知开关")
     sync_del_source: bool = Field(default=False, description="同步删除源文件")
@@ -771,6 +818,32 @@ class ConfigManager(BaseModel):
         default=False, description="媒体库已存在时拦截整理"
     )
 
+    timeout_enabled: bool = Field(default=True, description="启用请求超时控制")
+    timeout_default_connect: Union[int, float] = Field(
+        default=30, ge=0, description="普通操作连接超时（秒），0 表示不限制"
+    )
+    timeout_default_pool: Union[int, float] = Field(
+        default=15, ge=0, description="普通操作连接池超时（秒），0 表示不限制"
+    )
+    timeout_default_read: Union[int, float] = Field(
+        default=60, ge=0, description="普通操作读取超时（秒），0 表示不限制"
+    )
+    timeout_default_write: Union[int, float] = Field(
+        default=60, ge=0, description="普通操作写入超时（秒），0 表示不限制"
+    )
+    timeout_slow_connect: Union[int, float] = Field(
+        default=30, ge=0, description="慢操作连接超时（秒），0 表示不限制"
+    )
+    timeout_slow_pool: Union[int, float] = Field(
+        default=15, ge=0, description="慢操作连接池超时（秒），0 表示不限制"
+    )
+    timeout_slow_read: Union[int, float] = Field(
+        default=300, ge=0, description="慢操作读取超时（秒），0 表示不限制"
+    )
+    timeout_slow_write: Union[int, float] = Field(
+        default=300, ge=0, description="慢操作写入超时（秒），0 表示不限制"
+    )
+
     @field_serializer(
         "PLUGIN_CONFIG_PATH",
         "PLUGIN_DB_PATH",
@@ -785,7 +858,7 @@ class ConfigManager(BaseModel):
         """
         返回 p115center 许可证
         """
-        return "9898b17adf81b9fc08d7d4ef7fe387182ca89235e1fd5d5dff0c6d9f2e4f8866"
+        return "9a7fd3f1a902cea2042e2315a3b686aec20af7dcd05e022eadc63b5eeac62afd"
 
     @property
     def PLUGIN_ALIGO_PATH(self) -> Path:
@@ -930,6 +1003,34 @@ class ConfigManager(BaseModel):
             f"({system()} {release()}; "
             f"{SystemUtils.cpu_arch() if hasattr(SystemUtils, 'cpu_arch') and callable(SystemUtils.cpu_arch) else 'UnknownArch'})"
         )
+
+    def get_default_timeout(self) -> Optional[Dict[str, Any]]:
+        if not self.timeout_enabled:
+            return None
+        timeout = {}
+        if self.timeout_default_connect > 0:
+            timeout["connect"] = self.timeout_default_connect
+        if self.timeout_default_pool > 0:
+            timeout["pool"] = self.timeout_default_pool
+        if self.timeout_default_read > 0:
+            timeout["read"] = self.timeout_default_read
+        if self.timeout_default_write > 0:
+            timeout["write"] = self.timeout_default_write
+        return timeout if timeout else None
+
+    def get_slow_timeout(self) -> Optional[Dict[str, Any]]:
+        if not self.timeout_enabled:
+            return None
+        timeout = {}
+        if self.timeout_slow_connect > 0:
+            timeout["connect"] = self.timeout_slow_connect
+        if self.timeout_slow_pool > 0:
+            timeout["pool"] = self.timeout_slow_pool
+        if self.timeout_slow_read > 0:
+            timeout["read"] = self.timeout_slow_read
+        if self.timeout_slow_write > 0:
+            timeout["write"] = self.timeout_slow_write
+        return timeout if timeout else None
 
     def get_ios_ua_app(self, app: bool = True) -> Dict[str, Any]:
         """

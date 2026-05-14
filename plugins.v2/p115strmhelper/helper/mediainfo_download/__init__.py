@@ -2,6 +2,7 @@ from asyncio import Semaphore, gather, run as asyncio_run, sleep as asyncio_slee
 from base64 import b64decode
 from itertools import batched
 from pathlib import Path
+from threading import Lock
 from time import sleep as time_sleep
 from typing import Dict, Generator, List, Optional, Set, Tuple
 from urllib.parse import unquote, urlsplit
@@ -19,7 +20,7 @@ from httpx import (
 from orjson import loads
 from p115center import P115Center
 from p115pickcode import pickcode_to_id
-from p115client import P115Client, check_response
+from p115client import check_response
 from p115client.const import TYPE_TO_SUFFIXES
 from p115client.util import reduce_image_url_layers
 from p115client.tool.iterdir import (
@@ -32,6 +33,7 @@ from zstandard import ZstdCompressor, ZstdDecompressor
 from app.log import logger
 
 from ...core.config import configer
+from ...core.p115_client import create_client
 from ...core.cache import OofFastMiCache
 from ...utils.url import Url
 from ...utils.sentry import sentry_manager
@@ -51,7 +53,11 @@ class MediaInfoDownloader:
 
     def __init__(self, cookie: str):
         self.cookie = cookie
-        self.client = P115Client(cookie)
+        self.client = create_client(
+            cookie,
+            default_timeout=configer.get_default_timeout(),
+            slow_timeout=configer.get_slow_timeout(),
+        )
 
         self.oof_fast_mi_cacher = OofFastMiCache(
             configer.PLUGIN_TEMP_PATH / "oof_fast_mi"
@@ -85,6 +91,8 @@ class MediaInfoDownloader:
         self.mediainfo_count: int = 0
         self.mediainfo_fail_count: int = 0
         self.mediainfo_fail_dict: List = []
+
+        self._batch_lock = Lock()
 
         logger.debug(f"【媒体信息文件下载】初始化请求头：{self.headers}")
 
@@ -794,90 +802,100 @@ class MediaInfoDownloader:
         """
         根据列表自动批量下载
         """
-        image_suffix: Set[str] = set(TYPE_TO_SUFFIXES[2])
-        subtitle_suffix: Set[str] = {".srt", ".ass", ".ssa"}
-        oof_fast_mi_suffix: Set[str] = {".nfo"}
+        with self._batch_lock:
+            image_suffix: Set[str] = set(TYPE_TO_SUFFIXES[2])
+            subtitle_suffix: Set[str] = {".srt", ".ass", ".ssa"}
+            oof_fast_mi_suffix: Set[str] = {".nfo"}
 
-        self.stop_all_flag = False
-        self.mediainfo_count: int = 0
-        self.mediainfo_fail_count: int = 0
-        self.mediainfo_fail_dict: List = []
-        self._pending_delete_scids = []
+            self.stop_all_flag = False
+            self.mediainfo_count: int = 0
+            self.mediainfo_fail_count: int = 0
+            self.mediainfo_fail_dict: List = []
+            self._pending_delete_scids = []
 
-        image_list: List = []
-        subtitle_list: List = []
-        oof_fast_mi_list: List = []
-        other_list: List = []
+            image_list: List = []
+            subtitle_list: List = []
+            oof_fast_mi_list: List = []
+            other_list: List = []
 
-        subtitle_list_append = subtitle_list.append
-        image_list_append = image_list.append
-        oof_fast_mi_append = oof_fast_mi_list.append
-        other_list_append = other_list.append
+            subtitle_list_append = subtitle_list.append
+            image_list_append = image_list.append
+            oof_fast_mi_append = oof_fast_mi_list.append
+            other_list_append = other_list.append
 
-        for item in downloads_list:
-            suffix = Path(item["path"]).suffix
-            if suffix in subtitle_suffix:
-                subtitle_list_append(item)
-            elif suffix in image_suffix:
-                image_list_append(item)
-            elif suffix in oof_fast_mi_suffix:
-                oof_fast_mi_append(item)
-            else:
-                other_list_append(item)
+            for item in downloads_list:
+                suffix = Path(item["path"]).suffix
+                if suffix in subtitle_suffix:
+                    subtitle_list_append(item)
+                elif suffix in image_suffix:
+                    image_list_append(item)
+                elif suffix in oof_fast_mi_suffix:
+                    oof_fast_mi_append(item)
+                else:
+                    other_list_append(item)
 
-        if subtitle_list and not self.stop_all_flag:
-            self.batch_subtitle_downloader(subtitle_list)
-        if image_list and not self.stop_all_flag:
-            self.batch_image_downloader(image_list)
-        if oof_fast_mi_list and not self.stop_all_flag:
-            self.batch_oof_fast_mi_downloader(oof_fast_mi_list, u115_share=False)
-        if other_list and not self.stop_all_flag:
-            self.batch_downloader(other_list)
+            if subtitle_list and not self.stop_all_flag:
+                self.batch_subtitle_downloader(subtitle_list)
+            if image_list and not self.stop_all_flag:
+                self.batch_image_downloader(image_list)
+            if oof_fast_mi_list and not self.stop_all_flag:
+                self.batch_oof_fast_mi_downloader(oof_fast_mi_list, u115_share=False)
+            if other_list and not self.stop_all_flag:
+                self.batch_downloader(other_list)
 
-        self._flush_pending_deletes(force=True)
-        return self.mediainfo_count, self.mediainfo_fail_count, self.mediainfo_fail_dict
+            self._flush_pending_deletes(force=True)
+            return (
+                self.mediainfo_count,
+                self.mediainfo_fail_count,
+                self.mediainfo_fail_dict,
+            )
 
     def batch_auto_share_downloader(self, downloads_list: List):
         """
         根据列表自动批量分享下载
         """
-        subtitle_suffix: Set[str] = {".srt", ".ass", ".ssa"}
-        oof_fast_mi_suffix: Set[str] = {".nfo"}
+        with self._batch_lock:
+            subtitle_suffix: Set[str] = {".srt", ".ass", ".ssa"}
+            oof_fast_mi_suffix: Set[str] = {".nfo"}
 
-        self.mediainfo_count: int = 0
-        self.mediainfo_fail_count: int = 0
-        self.mediainfo_fail_dict: List = []
-        self._pending_delete_scids = []
+            self.mediainfo_count: int = 0
+            self.mediainfo_fail_count: int = 0
+            self.mediainfo_fail_dict: List = []
+            self._pending_delete_scids = []
 
-        image_list: List = []
-        subtitle_list: List = []
-        oof_fast_mi_list: List = []
-        other_list: List = []
+            image_list: List = []
+            subtitle_list: List = []
+            oof_fast_mi_list: List = []
+            other_list: List = []
 
-        subtitle_list_append = subtitle_list.append
-        image_list_append = image_list.append
-        oof_fast_mi_append = oof_fast_mi_list.append
-        other_list_append = other_list.append
+            subtitle_list_append = subtitle_list.append
+            image_list_append = image_list.append
+            oof_fast_mi_append = oof_fast_mi_list.append
+            other_list_append = other_list.append
 
-        for item in downloads_list:
-            suffix = Path(item["path"]).suffix
-            if item.get("thumb"):
-                image_list_append(item)
-            elif suffix in subtitle_suffix:
-                subtitle_list_append(item)
-            elif suffix in oof_fast_mi_suffix:
-                oof_fast_mi_append(item)
-            else:
-                other_list_append(item)
+            for item in downloads_list:
+                suffix = Path(item["path"]).suffix
+                if item.get("thumb"):
+                    image_list_append(item)
+                elif suffix in subtitle_suffix:
+                    subtitle_list_append(item)
+                elif suffix in oof_fast_mi_suffix:
+                    oof_fast_mi_append(item)
+                else:
+                    other_list_append(item)
 
-        if image_list:
-            asyncio_run(self.__async_download_batch_share(image_list))
-        if subtitle_list:
-            self.batch_share_subtitle_downloader(subtitle_list)
-        if oof_fast_mi_list:
-            self.batch_oof_fast_mi_downloader(oof_fast_mi_list, u115_share=True)
-        if other_list:
-            self.batch_share_downloader(other_list)
+            if image_list:
+                asyncio_run(self.__async_download_batch_share(image_list))
+            if subtitle_list:
+                self.batch_share_subtitle_downloader(subtitle_list)
+            if oof_fast_mi_list:
+                self.batch_oof_fast_mi_downloader(oof_fast_mi_list, u115_share=True)
+            if other_list:
+                self.batch_share_downloader(other_list)
 
-        self._flush_pending_deletes(force=True)
-        return self.mediainfo_count, self.mediainfo_fail_count, self.mediainfo_fail_dict
+            self._flush_pending_deletes(force=True)
+            return (
+                self.mediainfo_count,
+                self.mediainfo_fail_count,
+                self.mediainfo_fail_dict,
+            )
